@@ -1,0 +1,365 @@
+##########GBIF data process##########
+library(data.table)
+library(terra)
+library(tidyterra)
+library(stringr)
+#####global 0.5° raster definition#####
+crs <- '+proj=longlat +datum=WGS84'
+globalRaster <- rast(vals=1:259200,nrows=360, ncols=720,xmin=-180, xmax=180,ymin=-90, ymax=90,crs=crs)
+#####GBIF data#####
+basePath <- '/root/autodl-tmp/lxm/new/'
+allPath <- list.files(paste0(basePath,''),pattern='.csv',full.names=T)
+for (path in allPath) {
+birdData <- fread(path, select = c("decimalLatitude", "decimalLongitude", "species", "month", "year", "basisOfRecord", "order", "family", "genus"), 
+                    quote="",fill=TRUE) %>% 
+subset(.,basisOfRecord%in%c('HUMAN_OBSERVATION','OBSERVATION','OCCURRENCE','MACHINE_OBSERVATION')) %>% 
+    .[,basisOfRecord:=NULL]
+  birdData$species <- ifelse(birdData$species=='',NA,birdData$species)
+  birdData <- na.omit(birdData)
+  colnames(birdData)[1:2] <- c('lat','lon')
+#####Clean data for each species#####
+  speciesList <- unique(birdData$species)
+  for (sp in speciesList) {
+    # skip_to_next <- FALSE
+    # tryCatch({
+   spData <- subset(na.omit(birdData),species==sp)
+   spData <- subset(spData, year >= 1980 & year <= 2024)
+   if (nrow(spData) > 0) {
+      print(paste(sp, 'has been done!'))
+      print(path)
+      fwrite(spData, paste0('/root/autodl-tmp/lxm/one/', sp, '.csv'))
+    }
+  }
+}
+#####Spatial thinning#####
+allPath2 <- list.files('/root/autodl-tmp/lxm/one/',pattern='.csv',full.names=T)
+for (path in allPath2) {
+  spData <- fread(path)
+  sp <- basename(path) %>% str_sub(.,1,-5)
+  addGeom <- cellFromXY(globalRaster,spData[,c('lon','lat')]) %>% 
+    cbind(id=.,spData)
+  thinData <- addGeom %>%
+    group_by(id, month) %>%
+    slice(1) %>%
+    ungroup() %>%
+    select(-id)
+  print(paste(sp,'has been done!'))
+  fwrite(thinData,paste0('/root/autodl-tmp/lxm/filter/',sp,'.csv'))
+}
+
+##########SDM##########
+error_log <- list()
+filterPath <- list.files('/root/autodl-tmp/lxm/new-1/filter/terrestrial birds/success',pattern='.csv',full.names = T)
+crs <- '+proj=longlat +datum=WGS84'
+globalRaster <- rast(vals=1:259200,nrows=360, ncols=720,xmin=-180, xmax=180,ymin=-90, ymax=90,crs=crs)
+borderList <- list.files('/root/autodl-tmp/lxm/IUCN/',pattern = '.shp',full.names = T)
+boundary_shp <- rast('/root/autodl-tmp/lxm/environment/monthbio/CRU/prec1/prec_1.tif')
+
+for(path in filterPath){
+  df <- fread(path)
+  name <- basename(path) %>% str_sub(.,1,-5)
+  Border <- grep(name,borderList,value=T)
+  Border1 <- vect(Border)
+  for(m in unique(df$month)){
+    tryCatch({
+      dfMonth <- df[df$month == m, ]
+      if (nrow(dfMonth) <= 9) {
+        next
+      }
+      nameWithMonth <- paste0(name, "_", m)
+      targetDir <- file.path('/root/autodl-tmp/lxm/new-1/result/terrestrial birds/', name)
+      if (!dir.exists(targetDir)) {
+        dir.create(targetDir)
+      }
+      setwd(targetDir)
+      #####Background sampling#####
+      spVec <- vect(dfMonth[,c('lon','lat')],geom=c('lon','lat'),crs=crs)
+      spVec$class <- 1
+      absence1 <- crop(boundary_shp,Border1,inverse=T)
+      absence <- mask(absence1,Border1,inverse=T)
+      background <- terra::spatSample(absence,
+                                      size = dim(dfMonth)[1],   
+                                      na.rm = TRUE,
+                                      as.points=T,
+                                      method='random')
+      names(background) <- 'class'
+      background$class <- 0
+      Data <- rbind(spVec, background)
+      #####monthly climate data#####
+      tminPath <- list.files("/root/autodl-tmp/lxm/environment/monthbio/CRU/tmin1/", 
+                             pattern = paste0("tmin_", m, "\\.tif$"), 
+                             full.names = TRUE)
+      tmaxPath <- list.files("/root/autodl-tmp/lxm/environment/monthbio/CRU/tmax1/", 
+                             pattern = paste0("tmax_", m, "\\.tif$"), 
+                             full.names = TRUE)
+      precPath <- list.files("/root/autodl-tmp/lxm/environment/monthbio/CRU/prec1/", 
+                             pattern = paste0("prec_", m, "\\.tif$"), 
+                             full.names = TRUE)
+      tmpPath <- list.files("/root/autodl-tmp/lxm/environment/monthbio/CRU/tmp1/", 
+                            pattern = paste0("tmp_", m, "\\.tif$"), 
+                            full.names = TRUE)
+      dtrPath <- list.files("/root/autodl-tmp/lxm/environment/monthbio/CRU/dtr1/", 
+                            pattern = paste0("dtr_", m, "\\.tif$"), 
+                            full.names = TRUE)
+      
+      tmp  <- resample(rast(tmpPath),  globalRaster)
+      tmin <- resample(rast(tminPath), globalRaster)
+      tmax <- resample(rast(tmaxPath), globalRaster)
+      prec <- resample(rast(precPath), globalRaster)
+      dtr  <- resample(rast(dtrPath),  globalRaster)
+      
+      names(tmp) <- 'tmp'
+      names(tmin) <- 'tmin'
+      names(tmax) <- 'tmax'
+      names(prec) <- 'prec'
+      names(dtr) <- 'dtr'
+      
+      #####Elevation#####
+      ele <- rast('/root/autodl-tmp/lxm/environment/dixing/10mele/elev.tif') %>% resample(., globalRaster)
+      names(ele) <- 'ele'
+      
+      predictors <- c(tmp, tmin, tmax, prec, dtr, ele)
+      
+      #####Variable selection#####
+      BiomodData_test <- BIOMOD_FormatingData(resp.var = Data,
+                                              expl.var = predictors,
+                                              resp.name = 'test',
+                                              filter.raster = TRUE
+      )
+      myBiomodModelOut_test <- BIOMOD_Modeling(bm.format = BiomodData_test,
+                                               models = 'GLM',
+                                               CV.strategy = 'random',
+                                               CV.perc = 0.7,
+                                               CV.nb.rep = 3,
+                                               var.import = 5,
+                                               scale.models = T,
+                                               prevalence = 0.5,
+                                               nb.cpu = 4,
+                                               seed.val = 123,
+                                               metric.eval = c('TSS'))
+      importData <- get_variables_importance(myBiomodModelOut_test) %>% as.data.table()
+      importVar <- importData[,.(importVal=mean(var.imp)),.(expl.var)] %>% subset(.,importVal>0)
+      vals <- terra::values(predictors[[importVar$expl.var]], mat = TRUE)
+      corMatrix <- cor(vals, use = "complete.obs", method = "pearson")
+      highCorPairs <- which(abs(corMatrix) > 0.8, arr.ind = TRUE)
+      highCorPairs <- highCorPairs[highCorPairs[, 1] < highCorPairs[, 2], , drop = FALSE]
+      corValues <- corMatrix[highCorPairs]
+      sortedIndices <- order(abs(corValues), decreasing = TRUE)
+      highCorPairs <- highCorPairs[sortedIndices, , drop = FALSE]
+      deletedVars <- c()
+      pair <- 1
+      while (pair <= nrow(highCorPairs)) {
+        var1 <- rownames(corMatrix)[highCorPairs[pair, "row"]]
+        var2 <- rownames(corMatrix)[highCorPairs[pair, "col"]]
+        importDataVar1 <- importVar[importVar$expl.var == var1, ]
+        importDataVar2 <- importVar[importVar$expl.var == var2, ]
+        if (importDataVar1$importVal > importDataVar2$importVal) {
+          deletedVars <- c(deletedVars, var2)
+        } else {
+          deletedVars <- c(deletedVars, var1)
+        }
+        highCorPairs <- highCorPairs[!(
+          rownames(corMatrix)[highCorPairs[, "row"]] %in% deletedVars |
+            rownames(corMatrix)[highCorPairs[, "col"]] %in% deletedVars
+        ), , drop = FALSE]
+      }
+      remainingVars <- setdiff(importVar$expl.var, deletedVars)
+      predictorremain <- predictors[[remainingVars]]  
+      
+      #####Land use #####
+      landuse <- rast('/root/autodl-tmp/lxm/environment/landuse/Globio4_GBW_LU_2000_0.5.tif')%>% round(.,digits=0)
+      water <- ifel(landuse==210,1,0)
+      shrubland <- ifel(landuse%in%c(120, 121, 122, 140, 150, 151, 152, 153),1,0)
+      grassland <- ifel(landuse%in%c(20, 21, 22, 110, 130),1,0)
+      cropland <- ifel(landuse%in%c(10, 11, 12, 13, 14),1,0)
+      bareland <- ifel(landuse%in%c(200, 201, 202),1,0)
+      woodland <- ifel(landuse%in%c(30,40,seq(50,100), 160, 170),1,0)
+      urban <- ifel(landuse==1,1,0)
+      
+      names(water) <- 'water'
+      names(shrubland) <- 'shrubland'
+      names(grassland) <- 'grassland'
+      names(cropland) <- 'cropland'
+      names(bareland) <- 'bareland'
+      names(woodland) <- 'woodland'
+      names(urban) <- 'urban'
+      
+      predictorss <- c(predictorremain,water,shrubland,grassland,cropland,bareland,urban,woodland)
+      
+#####Modeling#####
+      #1
+      BiomodData <- BIOMOD_FormatingData(resp.var = Data,
+                                         expl.var = predictorss,
+                                         resp.name = nameWithMonth,
+                                         filter.raster = TRUE
+      )
+      print('1 done!')
+      #2
+      myBiomodModelOut <- BIOMOD_Modeling(
+        bm.format = BiomodData,
+        models = c("ANN", "RF", "MAXNET"),
+        CV.strategy = 'kfold',
+        CV.k = 5,    
+        CV.nb.rep = 1,
+        var.import = 5,
+        scale.models = TRUE,
+        prevalence = 0.5,
+        nb.cpu = 4,
+        seed.val = 123,
+        metric.eval = c("TSS")
+      )
+      eval_data <- get_evaluations(myBiomodModelOut)
+      eval_df <- as.data.frame(eval_data) 
+      output_path <- file.path('/root/autodl-tmp/lxm/new-1/result/terrestrial birds',name, paste0('eval_', m, '.csv'))
+      write.csv(eval_df, file = output_path, row.names = FALSE)
+      print('2 done!')
+      #3
+      myBiomodEM <- BIOMOD_EnsembleModeling(bm.mod = myBiomodModelOut,
+                                            models.chosen = 'all',
+                                            em.by = 'all',
+                                            em.algo = 'EMmean',
+                                            metric.select = c('TSS'),
+                                            metric.select.thresh = c(0.7),
+                                            metric.eval = c('TSS'),
+                                            nb.cpu = 4)
+      eval_data1 <- get_evaluations(myBiomodEM)
+      eval_df1 <- as.data.frame(eval_data1) 
+      output_path <- file.path('/root/autodl-tmp/lxm/new-1/result/terrestrial birds',name, paste0('Emeval_', m, '.csv'))
+      write.csv(eval_df1, file = output_path, row.names = FALSE)
+      print('3 done!')
+      #4
+      myBiomodEMProj <- BIOMOD_EnsembleForecasting(bm.em = myBiomodEM, 
+                                                   new.env =predictorss,
+                                                   proj.name=nameWithMonth,
+                                                   models.chosen = 'all',
+                                                   metric.binary = 'TSS',
+                                                   output.format='.tif')
+      print(paste(nameWithMonth,'has been done!'))
+    }, error = function(e) {
+      print(paste("Error in species:", name, "Month:", m))
+      print(paste("Error message:", e$message))
+
+      if (is.null(error_log[[name]])) error_log[[name]] <- c()
+      error_log[[name]] <- c(error_log[[name]], paste("Month", m, "failed:", e$message))
+      
+      return(NULL) 
+    })
+  }
+}
+
+##########validation##########
+outBreak <- vect('/root/autodl-tmp/lxm/outbreak/seabirds/seabirds.shp') %>% as.data.frame(geom='XY')
+crs <- '+proj=longlat +datum=WGS84'
+globalRaster <- rast(vals=1:259200,nrows=360, ncols=720,xmin=-180, xmax=180,ymin=-90, ymax=90,crs=crs)
+addGeom <- cellFromXY(globalRaster,outBreak[,c('x','y')]) %>% 
+  cbind(id=.,outBreak)
+thinData <- unique(data.table(addGeom),by='id') %>% dplyr::select(.,-id)
+outBreak2 <- vect(thinData,geom=c('x','y'),crs=crs)
+
+overEntropyNum <- rast('/root/autodl-tmp/lxm/new-1/index/TSDOI.tif')
+plot(overEntropyNum)
+global(overEntropyNum,quantile,probs=seq(0, 1, 0.05),na.rm=T)
+
+df <- terra::extract(overEntropyNum,outBreak2,mean,bind=T,exact=T,touches=T,na.rm=T,cells=T)%>% as.data.frame()
+allDf <- terra::as.data.frame(overEntropyNum,cells=T)
+
+library(pROC)
+df$label <- "good"
+rocDf <- left_join(allDf,df[,c('cell','label')])
+rocDf$label <- ifelse(is.na(rocDf$label),'poor',rocDf$label)
+dfroc1<- roc(rocDf$label, rocDf$sum)
+plot(dfroc1,col="red",
+     legacy.axes=T,
+     print.auc=TRUE,
+     expand=c(0,0),
+     print.thres=TRUE,
+     grid=c(0.2,0.2),grid.col=c("blue","yellow"))
+
+##########mantel##########
+png("/home/lxm/Rplot01.png", width = 5376, height = 3712, res = 600)  
+library(ggplot2)
+library(dplyr)
+library(vegan)
+library(linkET)
+
+crs <- '+proj=longlat +datum=WGS84'
+globalRaster <- rast(vals=1:259200,nrows=360, ncols=720,xmin=-180, xmax=180,ymin=-90, ymax=90,crs=crs)
+load_and_align_raster <- function(path, reference_raster) {
+  r <- rast(path)
+  if (is.na(crs(r))) {
+    crs(r) <- crs(reference_raster)}
+  if (crs(r) != crs(reference_raster)) {
+    r <- project(r, reference_raster) }
+  r <- resample(r, reference_raster)
+  return(r)}
+Index <- load_and_align_raster('/root/autodl-tmp/lxm/new-1/mantel/Mantel_data/TSDOI100.tif', globalRaster)
+Land <- load_and_align_raster('/root/autodl-tmp/lxm/new-1/mantel/Mantel_data/terrestrial.tif', globalRaster)
+Sea <- load_and_align_raster('/root/autodl-tmp/lxm/new-1/mantel/Mantel_data/sea.tif', globalRaster)
+bio1temp <- load_and_align_raster('/root/autodl-tmp/lxm/new-1/mantel/Mantel_data/bio_1.tif', globalRaster)
+bio12prec <- load_and_align_raster('/root/autodl-tmp/lxm/new-1/mantel/Mantel_data/bio_12.tif', globalRaster)
+below0Days <- load_and_align_raster('/root/autodl-tmp/lxm/new-1/mantel/Mantel_data/below0Days.tif', globalRaster)
+GPP <- load_and_align_raster('/root/autodl-tmp/lxm/new-1/mantel/Mantel_data/GPP0016_M_mean.tif', globalRaster)
+GPP_CV <- load_and_align_raster('/root/autodl-tmp/lxm/new-1/mantel/Mantel_data/GPP0016_M_CV.tif', globalRaster)
+newclimateBirdData <- load_and_align_raster('/root/autodl-tmp/lxm/new-1/mantel/Mantel_data/climateBirdData.tif', globalRaster)
+otherClimateData <- newclimateBirdData[[c("NDVI", "NDWI", "LAI", "Npp", "nightLight", "roadDensity")]]
+pop_log <- load_and_align_raster('/root/autodl-tmp/lxm/new-1/mantel/Mantel_data/pop_log.tif', globalRaster)
+mask_inf <- is.infinite(pop_log)
+pop_log[mask_inf] <- NA
+Global_corData <- c(Index, Land, Sea, bio1temp, bio12prec, below0Days, GPP, GPP_CV, otherClimateData, pop_log)
+Global_corData_df <- Global_corData %>% as.data.frame(xy=T)
+names(Global_corData_df)<-c('Longititude', 'Latitude' ,'Index','Land','Sea',
+                            'Temperature', 'Precipitation', 'Frost Days',
+                            'GPP', 'GPP CV',
+                            "NPP", "NDVI", "NDWI","LAI",
+                            'Light Density', 'Road Density', 'Human(Log)')
+Global_corData_df <- na.omit(Global_corData_df)
+env_var <- Global_corData_df %>% 
+  select(-c(Index,Land,Sea,Longititude,Latitude))
+total <- Global_corData_df %>% 
+  select(c(Index,Land,Sea))
+mantel_data <- read.csv("/root/autodl-tmp/lxm/new-1/mantel/Mantel_data/result.csv")
+mantel_data <- mantel_data %>%
+  mutate(
+    rd = cut(r, breaks = c(-Inf, 0.05, 0.1, Inf), labels = c("< 0.05", "0.05 - 0.1", ">= 0.1")),
+    pd = cut(p, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("< 0.01", "0.01 - 0.05", ">= 0.05"))
+  )
+mdata <- correlate(env_var)
+mdata_df <- as.data.frame(mdata$r)
+qcorrplot(mdata,
+          type = "lower", 
+          diag = F)+
+  geom_square()+ 
+  scale_fill_gradientn(colours = RColorBrewer::brewer.pal(11, "RdBu"))
+mantel <- mantel_data %>%
+  filter(p < 0.01) %>%
+  mutate(spec = case_when(
+    spec == "Index" ~ "TSDOI",
+    spec == "Land" ~ "TAE",
+    spec == "Sea" ~ "SAE",
+    TRUE ~ spec
+  ))
+qcorrplot(mdata, type = "lower", diag = FALSE, is_corr = TRUE) +
+  geom_square() +
+  geom_couple(aes(colour = rd, linetype = pd), size = 1,
+              data = mantel, label.size = 6,
+              curvature = nice_curvature()) +
+  scale_fill_gradientn(colours = RColorBrewer::brewer.pal(11, "RdBu")) +
+  scale_linetype_manual(values = c("< 0.01" = "solid", 
+                                   "0.01 - 0.05" = "dashed", 
+                                   ">= 0.05" = "blank")) + 
+  scale_size_manual(values = c(1, 2)) +
+  scale_colour_manual(values = c("#e8f0ff","#5db2f6","#2357a9")) +
+  guides(
+    colour = guide_legend(title = "Mantel's r",
+                          override.aes = list(size = 3), 
+                          order = 1),
+    linetype = guide_legend(title = "Mantel's p",
+                            override.aes = list(size = 3), 
+                            order = 3),
+    fill = guide_colorbar(title = "Pearson's r", order = 3)) +
+  theme(text = element_text(size = 15),
+        axis.text = element_text(size = 15))
+dev.off()
+
+
+
