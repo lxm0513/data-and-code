@@ -23,7 +23,7 @@ subset(.,basisOfRecord%in%c('HUMAN_OBSERVATION','OBSERVATION','OCCURRENCE','MACH
     # skip_to_next <- FALSE
     # tryCatch({
    spData <- subset(na.omit(birdData),species==sp)
-   spData <- subset(spData, year >= 1980 & year <= 2024)
+   spData <- subset(spData, year >= 2000 & year <= 2024)
    if (nrow(spData) > 0) {
       print(paste(sp, 'has been done!'))
       print(path)
@@ -52,14 +52,11 @@ error_log <- list()
 filterPath <- list.files('/root/autodl-tmp/lxm/new-1/filter/terrestrial birds/success',pattern='.csv',full.names = T)
 crs <- '+proj=longlat +datum=WGS84'
 globalRaster <- rast(vals=1:259200,nrows=360, ncols=720,xmin=-180, xmax=180,ymin=-90, ymax=90,crs=crs)
-borderList <- list.files('/root/autodl-tmp/lxm/IUCN/',pattern = '.shp',full.names = T)
 boundary_shp <- rast('/root/autodl-tmp/lxm/environment/monthbio/CRU/prec1/prec_1.tif')
 
 for(path in filterPath){
   df <- fread(path)
   name <- basename(path) %>% str_sub(.,1,-5)
-  Border <- grep(name,borderList,value=T)
-  Border1 <- vect(Border)
   for(m in unique(df$month)){
     tryCatch({
       dfMonth <- df[df$month == m, ]
@@ -75,13 +72,18 @@ for(path in filterPath){
       #####Background sampling#####
       spVec <- vect(dfMonth[,c('lon','lat')],geom=c('lon','lat'),crs=crs)
       spVec$class <- 1
-      absence1 <- crop(boundary_shp,Border1,inverse=T)
-      absence <- mask(absence1,Border1,inverse=T)
-      background <- terra::spatSample(absence,
-                                      size = dim(dfMonth)[1],   
+      occurrenceraster <- rasterize(spVec, boundary_shp, 1)
+      presences <- which(values(occurrenceraster) == 1)
+      presencesloc <- xyFromCell(occurrenceraster, presences)
+      #KDE
+      density <- kde2d(presencesloc[,1], presencesloc[,2], n = c(nrow(occurrenceraster), ncol(occurrenceraster)))
+      densityraster <- raster(density)
+      background <- terra::spatSample(boundary_shp,
+                                      size = dim(dfMonth)[1]*1,   
                                       na.rm = TRUE,
                                       as.points=T,
-                                      method='random')
+                                      method='random',
+                                      prob = values(densityraster))
       names(background) <- 'class'
       background$class <- 0
       Data <- rbind(spVec, background)
@@ -334,8 +336,8 @@ mantel <- mantel_data %>%
   filter(p < 0.01) %>%
   mutate(spec = case_when(
     spec == "Index" ~ "TSDOI",
-    spec == "Land" ~ "TAE",
-    spec == "Sea" ~ "SAE",
+    spec == "Land" ~ "TSR",
+    spec == "Sea" ~ "SSR",
     TRUE ~ spec
   ))
 qcorrplot(mdata, type = "lower", diag = FALSE, is_corr = TRUE) +
